@@ -1,6 +1,7 @@
 package tests_test
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -10,9 +11,11 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
-	"github.com/vladikr/simpletbt/pkg/tbt"
+	tbt "github.com/vladikr/simpletbt"
 	"github.com/vladikr/simpletbt/tests"
 )
+
+const TCPServerAddress = "127.0.0.1:54321"
 
 func measureConnBandwidth(conn net.Conn) float64 {
 	start := time.Now()
@@ -22,54 +25,63 @@ func measureConnBandwidth(conn net.Conn) float64 {
 }
 
 var _ = Describe("TCP Server", func() {
-	Context("with trottled transmission", func() {
-		var bandwidthLimitPerServer float64
-		var bandwidthLimitPerConnection float64
-		var shutdownChan chan bool
-		var trottle *tbt.TransmissionBandwidthTrottle
+	Context("with throttled transmission", func() {
+		var (
+			bandwidthLimitPerServer     float64
+			bandwidthLimitPerConnection float64
+			throttle                    *tbt.TransmissionBandwidthThrottle
+			cancel                      context.CancelFunc
+		)
 		BeforeEach(func() {
-			shutdownChan = make(chan bool)
 			bandwidthLimitPerServer = float64(500000)
 			bandwidthLimitPerConnection = float64(100000)
-			trottle = tbt.NewTransmissionBandwidthTrottle(
+			throttle = tbt.NewTransmissionBandwidthThrottle(
 				float64(300),
 				float64(100))
-			sampleDuration := 30
+			sampleDuration := time.Now().Add(30 * time.Second)
+			ctx, cancelFunc := context.WithDeadline(context.Background(), sampleDuration)
+			cancel = cancelFunc
 			By("starting a TCP Server")
-			tests.StartTestTCPServer(trottle, sampleDuration, shutdownChan)
-			trottle.SetServerBandwidthLimit(bandwidthLimitPerServer)
-			trottle.SetConnectionBandwidthLimit(bandwidthLimitPerConnection)
+			tests.StartTestTCPServer(ctx, throttle, TCPServerAddress)
+			By("Updating Bandwidth limits")
+			throttle.SetServerBandwidthLimit(bandwidthLimitPerServer)
+			throttle.SetConnectionBandwidthLimit(bandwidthLimitPerConnection)
 		})
 		AfterEach(func() {
 			//close the test server
-			shutdownChan <- true
+			cancel()
 		})
+		connectToTCPServer := func(connectionNumber int) net.Conn {
+			By(fmt.Sprintf("connecting to the TCP Server - %d", connectionNumber))
+			conn, err := net.Dial("tcp", TCPServerAddress)
+			Expect(err).ToNot(HaveOccurred(), "should connect to the test server without errors")
+			return conn
+		}
+
+		reportSingleConnectionBandwidthMeasurment := func(conn net.Conn, bandwidthChan chan float64, cNum int) {
+			defer conn.Close()
+
+			By(fmt.Sprintf("measuring the bandwidth per connection - %d", cNum))
+			bandwidth := measureConnBandwidth(conn)
+			bandwidthChan <- bandwidth
+		}
+
 		getConnsBandwidthResults := func(connections int, updateConnBandwidth int) []float64 {
 			var bandwidthChanlList []chan float64
 			var connectionsBandwidthResults []float64
 			for c := 0; c < connections; c++ {
 				bandwidthChan := make(chan float64)
 				bandwidthChanlList = append(bandwidthChanlList, bandwidthChan)
-				go func(bandwidthChan chan float64, cNum int) {
+				conn := connectToTCPServer(c)
+				go reportSingleConnectionBandwidthMeasurment(conn, bandwidthChan, c)
 
-					By(fmt.Sprintf("connecting to the TCP Server - %d", cNum))
-					conn, err := net.Dial("tcp", "127.0.0.1:54321")
-					if err != nil {
-						Expect(err).ToNot(HaveOccurred(), "should connect to the test server without errors")
-					}
-					defer conn.Close()
-
-					// update bandwidth limit for all connections
-					if updateConnBandwidth != 0 && cNum == connections-1 {
-						By("updating bandwidth limit for all connections")
-						time.Sleep(5 * time.Second)
-						trottle.SetConnectionBandwidthLimit(200000)
-					}
-					By(fmt.Sprintf("measuring the bandwidth per connection - %d", cNum))
-					bandwidth := measureConnBandwidth(conn)
-					bandwidthChan <- bandwidth
-				}(bandwidthChan, c)
+				if updateConnBandwidth != 0 {
+					By("updating bandwidth limit for all running connections")
+					time.Sleep(5 * time.Second)
+					throttle.SetConnectionBandwidthLimit(200000)
+				}
 			}
+			By("Collecting bandwidth results from all reported connections")
 			for _, bwChan := range bandwidthChanlList {
 				select {
 				case bwVal := <-bwChan:

@@ -9,5 +9,5 @@ import (
 
 func TestAdder(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "Transmission Bandwidth Trottle Suite")
+	RunSpecs(t, "Transmission Bandwidth Throttle Suite")
 }
